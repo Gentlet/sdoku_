@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: judge-db
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: judge
+      MYSQL_USER: judge
+      MYSQL_PASSWORD: judgepw
+    volumes:
+      - ./db/data:/var/lib/mysql
+    restart: unless-stopped
+
+  judge-api:
+    build: ./judge-api
+    container_name: judge-api
+    environment:
+      DB_HOST: db
+      DB_USER: judge
+      DB_PASSWORD: judgepw
+      DB_NAME: judge
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx-web
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/html:/usr/share/nginx/html:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/log:/var/log/nginx
+    depends_on:
+      - judge-api
+    restart: unless-stopped
