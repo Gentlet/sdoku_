@@ -2,7 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { exec, spawn } = require('child_process');
+const { spawn } = require('child_process');
 
 const db = require('./db');
 
@@ -82,97 +82,131 @@ app.post('/submit', async (req, res) => {
   );
   const submissionId = subIns.insertId;
 
-  // run all cases (케이스마다 래핑/컴파일/실행)
+  // run all cases (한 번 컴파일 후 모든 케이스 실행)
   let overall = 'AC';
-  let maxTimeMs = null;
+  let maxCaseTimeMs = null;
   let maxMemKb = null;
 
   const caseResults = [];
+  let lastStderr = '';
 
-  for (const tc of cases) {
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-'));
-    const sourcePath = path.join(workDir, 'main.cpp');
-    const binaryPath = path.join(workDir, 'main');
+  const perCaseLimitMs = Number(problem.time_limit_ms || 2000);
+  const totalLimitMs = Number(process.env.TOTAL_TIME_LIMIT_MS || 30000); // 기본 총합 30s (실행 시간 기준)
+  const startedAt = Date.now(); // 전체 처리 시간 (로그/통계용)
+  let totalElapsedMs = 0; // 전체 처리 시간
+  let processedCases = 0;
 
-    try {
-      const wrapped = buildWrappedCode(code, tc.input_text, tc.expected_output);
-      fs.writeFileSync(sourcePath, wrapped, 'utf8');
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-'));
+  const sourcePath = path.join(workDir, 'main.cpp');
+  const binaryPath = path.join(workDir, 'main');
 
-      const compileRes = await runCompile(sourcePath, binaryPath, workDir);
-      if (!compileRes.ok) {
-        overall = 'CE';
+  try {
+    // 한 번만 컴파일 (모든 케이스를 소스에 포함)
+    const wrapped = buildWrappedCode(code, cases);
+    fs.writeFileSync(sourcePath, wrapped, 'utf8');
+
+    const compileRes = await runCompile(sourcePath, binaryPath, workDir);
+    if (!compileRes.ok) {
+      overall = 'CE';
+      lastStderr = clip(compileRes.stderr, 20000);
+
+      const firstCaseId = cases[0].id;
+      await db.query(
+        `INSERT INTO submission_results
+         (submission_id, test_case_id, status, exec_time_ms, memory_kb, stdout, stderr)
+         VALUES (?,?,?,?,?,?,?)`,
+        [submissionId, firstCaseId, 'CE', null, null, '', lastStderr]
+      );
+    } else {
+      // 한 번 실행하여 모든 케이스를 처리 (타임아웃은 실행 시간 기준)
+      const execStartedAt = Date.now();
+      const execRes = await runWithTime(binaryPath, workDir, '', totalLimitMs);
+      const execElapsedMs = execRes.execTimeMs != null ? execRes.execTimeMs : (Date.now() - execStartedAt);
+      const parsed = parseBatchResult(execRes.stdout, cases.length);
+
+      maxCaseTimeMs = parsed.times.filter(v => v != null).reduce((a, b) => Math.max(a, b), 0);
+      if (execRes.memoryKb != null) maxMemKb = execRes.memoryKb;
+
+      let stopEarly = false; // 실패 시 이후 케이스 처리 중단
+      for (let i = 0; i < cases.length; i++) {
+        const tc = cases[i];
+        const statusCode = parsed.statuses[i];
+        let status = 'AC';
+        if (execRes.timeout) status = 'TLE';
+        else if (statusCode === 0) status = 'AC';
+        else status = 'WA';
+
+        if (overall === 'AC' && status !== 'AC') overall = status;
+        lastStderr = clip(execRes.stderr, 20000);
 
         await db.query(
           `INSERT INTO submission_results
            (submission_id, test_case_id, status, exec_time_ms, memory_kb, stdout, stderr)
            VALUES (?,?,?,?,?,?,?)`,
-          [submissionId, tc.id, 'CE', null, null, '', clip(compileRes.stderr, 20000)]
+          [
+            submissionId,
+            tc.id,
+            status,
+            parsed.times[i],
+            null,
+            '',
+            lastStderr
+          ]
         );
 
-        // 컴파일 에러는 즉시 종료
-        break;
+        caseResults.push({
+          testCaseId: tc.id,
+          status,
+          execTimeMs: parsed.times[i],
+          memoryKb: null
+        });
+
+        processedCases += 1;
+
+        // 실패(AC 아님) 발견 시 즉시 중단
+        if (status !== 'AC') {
+          stopEarly = true;
+          break;
+        }
       }
 
-      // wrapper가 INPUT/EXPECTED를 코드에 박기 때문에 stdin은 필요 없음
-      const execRes = await runWithTime(binaryPath, workDir, '', Number(problem.time_limit_ms || 2000));
+      totalElapsedMs = Date.now() - startedAt;
 
-      if (execRes.execTimeMs != null) maxTimeMs = (maxTimeMs == null) ? execRes.execTimeMs : Math.max(maxTimeMs, execRes.execTimeMs);
-      if (execRes.memoryKb != null) maxMemKb = (maxMemKb == null) ? execRes.memoryKb : Math.max(maxMemKb, execRes.memoryKb);
-
-      let status = 'AC';
-      if (execRes.timeout) status = 'TLE';
-      else if (execRes.exitCode !== 0) status = 'WA'; // wrapper 검증 실패시 non-zero 종료
-
-      if (overall === 'AC' && status !== 'AC') overall = status;
-
-      await db.query(
-        `INSERT INTO submission_results
-         (submission_id, test_case_id, status, exec_time_ms, memory_kb, stdout, stderr)
-         VALUES (?,?,?,?,?,?,?)`,
-        [
-          submissionId,
-          tc.id,
-          status,
-          execRes.execTimeMs,
-          execRes.memoryKb,
-          '', // stdout 채점에 사용 안 함
-          clip(execRes.stderr, 20000)
-        ]
-      );
-
-      caseResults.push({
-        testCaseId: tc.id,
-        status,
-        execTimeMs: execRes.execTimeMs,
-        memoryKb: execRes.memoryKb
-      });
-
-      // 하나라도 틀리면 끝내고 싶으면 주석 해제
-      // if (status !== 'AC') break;
-    } catch (e) {
-      overall = 'RE';
-      await db.query(
-        `INSERT INTO submission_results
-         (submission_id, test_case_id, status, exec_time_ms, memory_kb, stdout, stderr)
-         VALUES (?,?,?,?,?,?,?)`,
-        [submissionId, tc.id, 'RE', null, null, '', clip(String(e), 20000)]
-      );
-      break;
-    } finally {
-      cleanup(workDir);
+      // 실행 시간 기준 시간 초과 체크 (DB insert 등은 포함하지 않음)
+      if (overall === 'AC' && (execRes.timeout || execElapsedMs > totalLimitMs)) {
+        overall = 'TLE';
+        lastStderr = `total time limit exceeded (${totalLimitMs} ms)`;
+      }
     }
+  } catch (e) {
+    overall = 'RE';
+    await db.query(
+      `INSERT INTO submission_results
+       (submission_id, test_case_id, status, exec_time_ms, memory_kb, stdout, stderr)
+       VALUES (?,?,?,?,?,?,?)`,
+      [submissionId, cases[0]?.id || null, 'RE', null, null, '', clip(String(e), 20000)]
+    );
+  } finally {
+    cleanup(workDir);
   }
 
   await db.query(
     'UPDATE submissions SET status=?, exec_time_ms=?, memory_kb=? WHERE id=?',
-    [overall, maxTimeMs, maxMemKb, submissionId]
+    [overall, totalElapsedMs, maxMemKb, submissionId]
   );
 
   res.json({
     submissionId,
     status: overall,
-    execTimeMs: maxTimeMs,
-    memoryKb: maxMemKb
+    execTimeMs: totalElapsedMs,
+    maxCaseTimeMs,
+    memoryKb: maxMemKb,
+    totalElapsedMs,
+    processedCases,
+    totalCases: cases.length,
+    // 디버깅 편의를 위해 마지막 stderr와 케이스별 상태를 임시로 노출
+    lastStderr,
+    caseResults
   });
 });
 
@@ -189,12 +223,31 @@ async function getOrCreateUser(username, phone) {
 
 function runCompile(sourcePath, binaryPath, cwd) {
   return new Promise((resolve) => {
+    const compileTimeoutMs = Number(process.env.COMPILE_TIMEOUT_MS || 20000); // g++ 최대 대기
     const p = spawn('g++', ['-std=c++17', '-O2', sourcePath, '-o', binaryPath], { cwd });
     let stderr = '';
+    let killed = false;
+
+    const killProc = () => {
+      if (killed) return;
+      killed = true;
+      try { p.kill('SIGKILL'); } catch {/* ignore */}
+    };
+
+    const timer = setTimeout(() => {
+      stderr += `\n[compile timeout after ${compileTimeoutMs} ms]`;
+      killProc();
+    }, compileTimeoutMs);
+
     p.stderr.on('data', (d) => (stderr += d.toString()));
     p.on('close', (code) => {
-      if (code === 0) resolve({ ok: true });
+      clearTimeout(timer);
+      if (!killed && code === 0) resolve({ ok: true });
       else resolve({ ok: false, stderr });
+    });
+    p.on('error', (err) => {
+      stderr += `\n[spawn error] ${String(err)}`;
+      killProc();
     });
   });
 }
@@ -202,40 +255,84 @@ function runCompile(sourcePath, binaryPath, cwd) {
 /**
  * Run with:
  *   /usr/bin/time -v ./main
+ *
+ * - 출력 1MB 이상이면 강제 종료 (기존 exec maxBuffer 무시 문제 보완)
+ * - 타임아웃 시 프로세스 종료
  */
-function runWithTime(binaryPath, cwd, inputText, timeLimitMs) {
+function runWithTime(binaryPath, cwd, inputText, timeLimitMs, extraArgs = []) {
   return new Promise((resolve) => {
-    const cmd = `/usr/bin/time -v ./main`;
-    const child = exec(
-      cmd,
-      {
-        cwd,
-        timeout: timeLimitMs + 200,
-        maxBuffer: 1024 * 1024
-      },
-      (error, stdout, stderr) => {
-        const timeout = !!(error && error.killed);
-        const exitCode = (error && typeof error.code === 'number') ? error.code : 0;
+    const maxOutputBytes = 1024 * 1024; // 1MB
+    const child = spawn('/usr/bin/time', ['-v', binaryPath, ...extraArgs], {
+      cwd,
+      shell: false,
+      detached: false
+    });
 
-        const execTimeSec = parseUserTime(stderr);
-        const memoryKb = parseMaxRss(stderr);
+    let stdout = '';
+    let stderr = '';
+    let killed = false;
+    let timeout = false;
+    let outputOverflow = false;
 
-        resolve({
-          timeout,
-          exitCode,
-          stdout: stdout || '',
-          stderr: stderr || '',
-          execTimeMs: execTimeSec != null ? Math.round(execTimeSec * 1000) : null,
-          memoryKb: memoryKb != null ? memoryKb : null
-        });
+    const killChild = (signal = 'SIGKILL') => {
+      if (killed) return;
+      killed = true;
+      try {
+        child.kill(signal);
+      } catch {
+        /* ignore */
       }
-    );
+    };
+
+    const timer = setTimeout(() => {
+      timeout = true;
+      killChild();
+    }, timeLimitMs + 200);
+
+    const handleChunk = (chunk, isStdout) => {
+      const str = chunk.toString();
+      if (isStdout) stdout += str;
+      else stderr += str;
+
+      if (stdout.length + stderr.length > maxOutputBytes) {
+        outputOverflow = true;
+        stderr += '\n[truncated: output exceeded 1MB]\n';
+        killChild();
+      }
+    };
+
+    child.stdout.on('data', (d) => handleChunk(d, true));
+    child.stderr.on('data', (d) => handleChunk(d, false));
+
+    child.on('error', (err) => {
+      stderr += `\n[spawn error] ${String(err)}\n`;
+      killChild();
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      const exitCode = outputOverflow
+        ? 137 // treat as failure
+        : (typeof code === 'number' ? code : (signal ? 128 : 0));
+
+      const execTimeSec = parseUserTime(stderr);
+      const memoryKb = parseMaxRss(stderr);
+
+      resolve({
+        timeout,
+        exitCode,
+        stdout,
+        stderr,
+        execTimeMs: execTimeSec != null ? Math.round(execTimeSec * 1000) : null,
+        memoryKb: memoryKb != null ? memoryKb : null
+      });
+    });
 
     try {
       child.stdin.write(inputText || '');
       child.stdin.end();
     } catch {
-      // ignore
+      /* ignore */
     }
   });
 }
@@ -248,6 +345,24 @@ function parseUserTime(stderr) {
 function parseMaxRss(stderr) {
   const m = (stderr || '').match(/Maximum resident set size \(kbytes\):\s+(\d+)/);
   return m ? parseInt(m[1], 10) : null;
+}
+
+// CASE <idx> STATUS <status> TIME_MS <elapsed>
+function parseBatchResult(stdout, caseCount) {
+  const statuses = Array(caseCount).fill(null);
+  const times = Array(caseCount).fill(null);
+  const re = /CASE\s+(\d+)\s+STATUS\s+(-?\d+)\s+TIME_MS\s+(-?\d+)/g;
+  let m;
+  while ((m = re.exec(stdout || '')) !== null) {
+    const idx = Number(m[1]);
+    const st = Number(m[2]);
+    const t = Number(m[3]);
+    if (!Number.isNaN(idx) && idx >= 0 && idx < caseCount) {
+      statuses[idx] = st;
+      times[idx] = Number.isNaN(t) ? null : t;
+    }
+  }
+  return { statuses, times };
 }
 
 function cleanup(dir) {
@@ -299,9 +414,23 @@ function gridToCppArray(text) {
   return g.map(row => `  {${row.join(',')}}`).join(',\n');
 }
 
-function buildWrappedCode(userCode, inputText, expectedText) {
-  const inputArr = gridToCppArray(inputText);
-  const expectedArr = gridToCppArray(expectedText);
+function buildWrappedCode(userCode, cases) {
+  const caseBlocks = cases.map((tc, idx) => {
+    const inputArr = gridToCppArray(tc.input_text).split('\n').map(line => `      ${line}`).join('\n');
+    const expectedArr = gridToCppArray(tc.expected_output).split('\n').map(line => `      ${line}`).join('\n');
+    return `  { // case ${idx}
+    { // input
+      {
+${inputArr}
+      }
+    },
+    { // expected
+      {
+${expectedArr}
+      }
+    }
+  }`;
+  }).join(',\n');
 
   return `
 #include <bits/stdc++.h>
@@ -313,13 +442,13 @@ using Grid = array<array<int,9>,9>;
 ${userCode}
 // =====================
 
-static Grid INPUT = {
-${inputArr}
-};
+struct CaseIO { Grid in; Grid exp; };
+struct CaseResult { int status; long long time_ms; };
 
-static Grid EXPECTED = {
-${expectedArr}
+static const CaseIO CASES[] = {
+${caseBlocks}
 };
+static const int CASE_COUNT = sizeof(CASES)/sizeof(CASES[0]);
 
 static bool validRange(const Grid& g) {
   for (int r=0;r<9;r++) for (int c=0;c<9;c++) {
@@ -357,33 +486,90 @@ static bool validSudoku(const Grid& g) {
   return true;
 }
 
-static bool equalsExpected(const Grid& g) {
+static bool equalsExpected(const Grid& g, const Grid& exp) {
   for (int r=0;r<9;r++) for (int c=0;c<9;c++) {
-    if (g[r][c] != EXPECTED[r][c]) return false;
+    if (g[r][c] != exp[r][c]) return false;
   }
   return true;
 }
 
 int main() {
-  // 사용자가 반드시 제공해야 하는 함수:
-  // Grid solveSudoku(const Grid& input);
+  vector<CaseResult> results;
+  results.reserve(CASE_COUNT);
 
-  Grid out;
-  try {
-    out = solveSudoku(INPUT);
-  } catch (...) {
-    return 20; // 예외 -> WA
+  for (int idx = 0; idx < CASE_COUNT; ++idx) {
+    const Grid& INPUT = CASES[idx].in;
+    const Grid& EXPECTED = CASES[idx].exp;
+
+    Grid out;
+    int status = 0;
+    auto t0 = chrono::steady_clock::now();
+    try {
+      out = solveSudoku(INPUT);
+    } catch (...) {
+      status = 5; // exception
+    }
+    auto t1 = chrono::steady_clock::now();
+
+    if (status == 0) {
+      if (!validRange(out)) status = 1;
+      else if (!respectClues(INPUT, out)) status = 2;
+      else if (!validSudoku(out)) status = 3;
+      else if (!equalsExpected(out, EXPECTED)) status = 4;
+    }
+
+    long long elapsed = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count();
+    results.push_back({status, elapsed});
   }
 
-  if (!validRange(out)) return 1;
-  if (!respectClues(INPUT, out)) return 2;
-  if (!validSudoku(out)) return 3;
-  if (!equalsExpected(out)) return 4;
-
-  return 0; // AC
+  // 출력: CASE <idx> STATUS <status> TIME_MS <elapsed>
+  for (int i = 0; i < (int)results.size(); ++i) {
+    cout << "CASE " << i << " STATUS " << results[i].status << " TIME_MS " << results[i].time_ms << "\\n";
+        if (results[i].status != 0) {
+          // 첫 실패에서 즉시 종료
+          return 1;
+        }
+  }
+  return 0;
 }
 `;
 }
 
 const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => console.log(`Judge API listening on ${PORT}`));
+
+// DB 연결 테스트 후 서버 시작
+async function startServer() {
+  try {
+    // DB 연결 테스트
+    console.log('Testing DB connection...');
+    await db.query('SELECT 1');
+    console.log('DB connection OK');
+    
+    // 서버 시작
+    app.listen(PORT, () => {
+      console.log(`Judge API listening on ${PORT}`);
+    }).on('error', (err) => {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    });
+  } catch (err) {
+    console.error('Failed to start server - DB connection error:', err);
+    console.error('DB config:', {
+      host: process.env.DB_HOST || 'db',
+      user: process.env.DB_USER || 'judge',
+      database: process.env.DB_NAME || 'judge'
+    });
+    process.exit(1);
+  }
+}
+
+// 처리되지 않은 예외/프로미스 거부 시 로깅
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+startServer();
