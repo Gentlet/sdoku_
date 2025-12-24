@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>랭킹보드 - Sudoku Judge</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { padding: 12px; text-align: left; border: 1px solid #ddd; }
+    th { background: #f5f5f5; font-weight: bold; }
+    tr:nth-child(even) { background: #f9f9f9; }
+    .rank-1 { background: #ffd700 !important; }
+    .rank-2 { background: #c0c0c0 !important; }
+    .rank-3 { background: #cd7f32 !important; }
+    .btn { padding: 8px 16px; font-size: 14px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; text-decoration: none; display: inline-block; margin-bottom: 20px; }
+    .btn:hover { background: #0056b3; }
+    .loading { text-align: center; padding: 40px; }
+    .error { color: red; padding: 20px; }
+  </style>
+</head>
+<body>
+  <h1>랭킹보드</h1>
+  <a href="/" class="btn">메인으로 돌아가기</a>
+  
+  <div id="leaderboardContent">
+    <div class="loading">로딩 중...</div>
+  </div>
+
+<script>
+async function loadLeaderboard() {
+  const content = document.getElementById('leaderboardContent');
+  
+  try {
+    const r = await fetch('/api/leaderboard?limit=100');
+    if (!r.ok) {
+      throw new Error(`HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    
+    if (!Array.isArray(data) || data.length === 0) {
+      content.innerHTML = '<div class="error">랭킹 데이터가 없습니다.</div>';
+      return;
+    }
+    
+    let html = '<table>';
+    html += '<thead><tr>';
+    html += '<th style="text-align: center; width: 80px;">순위</th>';
+    html += '<th>유저명</th>';
+    html += '<th style="text-align: right;">총 실행시간</th>';
+    html += '<th style="text-align: right;">총 메모리</th>';
+    html += '<th style="text-align: center;">해결한 문제</th>';
+    html += '</tr></thead><tbody>';
+    
+    for (const user of data) {
+      const rank = user.rank || '-';
+      const username = user.username || '-';
+      const totalTime = user.total_time_ms != null ? `${user.total_time_ms} ms` : '-';
+      const totalMemory = user.total_memory_kb != null ? `${user.total_memory_kb} KB` : '-';
+      const solvedCount = user.solved_count || 0;
+      
+      const rankClass = rank === 1 ? 'rank-1' : rank === 2 ? 'rank-2' : rank === 3 ? 'rank-3' : '';
+      
+      html += `<tr class="${rankClass}">`;
+      html += `<td style="text-align: center; font-weight: bold;">${rank}</td>`;
+      html += `<td>${username}</td>`;
+      html += `<td style="text-align: right;">${totalTime}</td>`;
+      html += `<td style="text-align: right;">${totalMemory}</td>`;
+      html += `<td style="text-align: center;">${solvedCount}</td>`;
+      html += '</tr>';
+    }
+    
+    html += '</tbody></table>';
+    content.innerHTML = html;
+  } catch (err) {
+    content.innerHTML = `<div class="error">랭킹보드를 불러오는데 실패했습니다: ${err.message}</div>`;
+  }
+}
+
+// 페이지 로드시 랭킹보드 불러오기
+loadLeaderboard();
+</script>
+</body>
+</html>
+
+

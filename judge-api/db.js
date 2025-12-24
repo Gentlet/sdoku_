@@ -7,7 +7,10 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || 'judge',
   charset: 'utf8mb4',
   waitForConnections: true,
-  connectionLimit: 10
+  connectionLimit: 10,
+  queueLimit: 0, // 무제한 대기 (기본값)
+  enableKeepAlive: true, // 연결 유지로 재연결 오버헤드 감소
+  keepAliveInitialDelay: 0
 });
 
 

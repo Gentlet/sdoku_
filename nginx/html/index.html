@@ -15,6 +15,10 @@
 </head>
 <body>
   <h1>Sudoku Judge (C++ only)</h1>
+  
+  <div style="margin-bottom: 16px;">
+    <a href="/leaderboard.html" style="padding: 8px 16px; font-size: 14px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; text-decoration: none; display: inline-block;">랭킹보드</a>
+  </div>
 
   <!-- 문제는 1개 고정 -->
   <input type="hidden" id="problemId" value="1" />
@@ -109,13 +113,13 @@ async function loadSubs() {
     return;
   }
 
-  // 항상 최신이 위로 오게 보장
+  // 최신 제출부터 정렬
   data.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
   let lines = [];
   for (let i = 0; i < data.length; i++) {
     const sub = data[i];
-    const order = i + 1; // 최신이 1회
+    const order = data.length - i; // 최신이 마지막 번호 (예: 34회), 오래된 것이 1회
 
     const status = sub.status || 'UNKNOWN';
     const okText = (status === 'AC') ? '성공' : '실패';
@@ -170,28 +174,22 @@ document.getElementById('submit').onclick = async () => {
 
   const status = data.status || 'UNKNOWN';
   const okText = (status === 'AC') ? '성공' : '실패';
-  const timeText = (data.execTimeMs != null) ? `${data.execTimeMs} ms` : '-';
+  // totalExecTimeMs (실제 실행 시간 합계) 우선 사용, 없으면 execTimeMs 사용
+  const displayTime = (data.totalExecTimeMs != null && data.totalExecTimeMs > 0) ? data.totalExecTimeMs : data.execTimeMs;
+  const timeText = (displayTime != null) ? `${displayTime} ms` : '-';
   const memText  = (data.memoryKb != null) ? `${data.memoryKb} KB` : '-';
-  const totalText = (data.totalElapsedMs != null) ? `${data.totalElapsedMs} ms` : '-';
   const progressText = (data.processedCases != null && data.totalCases != null)
     ? `${data.processedCases} / ${data.totalCases}`
     : '-';
   const stderrText = data.lastStderr ? `\nstderr (마지막 케이스):\n${data.lastStderr}` : '';
-  const casesText = Array.isArray(data.caseResults) && data.caseResults.length
-    ? '\n케이스 결과:\n' + data.caseResults.map((c, i) =>
-        `  #${i+1} caseId=${c.testCaseId || '-'} status=${c.status} time=${c.execTimeMs ?? '-'}ms mem=${c.memoryKb ?? '-'}KB`
-      ).join('\n')
-    : '';
 
   // ✅ 결과창: 성공/시간/메모리만
   out.textContent =
     `성공 여부: ${okText}\n` +
     `경과 시간: ${timeText}\n` +
     `메모리: ${memText}\n` +
-    `진행 상황: ${progressText}\n` +
-    `총 소요 시간(벽시계): ${totalText}` +
-    stderrText +
-    casesText;
+    `진행 상황: ${progressText}` +
+    stderrText;
 
   await loadSubs();
 };

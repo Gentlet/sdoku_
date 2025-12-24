@@ -21,6 +21,7 @@ services:
       DB_USER: judge
       DB_PASSWORD: judgepw
       DB_NAME: judge
+      TOTAL_TIME_LIMIT_MS: 90000
     depends_on:
       - db
     restart: unless-stopped

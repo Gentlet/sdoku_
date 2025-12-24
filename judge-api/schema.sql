@@ -10,10 +10,16 @@ CREATE TABLE users (
   username VARCHAR(50) NOT NULL,
   phone VARCHAR(20) NOT NULL,
 
+  -- 랭킹 관련 필드
+  total_time_ms INT UNSIGNED NULL,  -- 모든 문제 AC 통과 시 총 실행시간
+  total_memory_kb INT UNSIGNED NULL,  -- 모든 문제 AC 통과 시 총 메모리 사용량
+  rank INT UNSIGNED NULL,  -- 전체 랭킹 (NULL이면 랭킹 미포함)
+
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
   -- 핵심: username + phone 조합이 유니크
-  UNIQUE KEY uniq_username_phone (username, phone)
+  UNIQUE KEY uniq_username_phone (username, phone),
+  INDEX idx_ranking (rank, total_time_ms, total_memory_kb)
 );
 
 CREATE TABLE problems (
