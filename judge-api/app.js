@@ -6,6 +6,12 @@ const { spawn } = require('child_process');
 
 const db = require('./db');
 
+// 디버깅 로그 제어 (환경변수로 활성화/비활성화)
+const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+const debugLog = (...args) => {
+  if (DEBUG) console.log(...args);
+};
+
 const app = express();
 app.use(express.json({ limit: '512kb' }));
 
@@ -27,7 +33,7 @@ app.get('/health', async (req, res) => {
  */
 app.get('/leaderboard', async (req, res) => {
   try {
-    const limit = Number(req.query.limit || 100);
+    const limit = Math.min(Number(req.query.limit || 100), 1000); // 최대 1000개로 제한
     
     const [rows] = await db.query(
       `SELECT 
@@ -192,7 +198,7 @@ app.post('/submit', async (req, res) => {
         maxMemKb = execRes.memoryKb;
       }
       
-      console.log(`[Submit] Parsed results: times=${JSON.stringify(parsed.times)}, statuses=${JSON.stringify(parsed.statuses)}, execRes.execTimeMs=${execRes.execTimeMs}, execRes.memoryKb=${execRes.memoryKb}`);
+      debugLog(`[Submit] Parsed results: times=${JSON.stringify(parsed.times)}, statuses=${JSON.stringify(parsed.statuses)}, execRes.execTimeMs=${execRes.execTimeMs}, execRes.memoryKb=${execRes.memoryKb}`);
 
       // 모든 케이스 결과를 수집한 후 배치 INSERT (성능 최적화)
       const insertValues = [];
@@ -299,8 +305,7 @@ app.post('/submit', async (req, res) => {
     maxMemKb = execRes.memoryKb;
   }
   
-  console.log(`[Submit] Submission ${submissionId}: status=${overall}, execTime=${execTimeForDb}ms, memory=${maxMemKb}KB, totalExecTimeMs=${totalExecTimeMs}, maxCaseTimeMs=${maxCaseTimeMs}, execRes.execTimeMs=${execRes?.execTimeMs}, execRes.memoryKb=${execRes?.memoryKb}, totalElapsedMs=${totalElapsedMs}`);
-  console.log(`[Submit] Checking if overall === 'AC': overall="${overall}", type=${typeof overall}, comparison=${overall === 'AC'}`);
+  debugLog(`[Submit] Submission ${submissionId}: status=${overall}, execTime=${execTimeForDb}ms, memory=${maxMemKb}KB, totalExecTimeMs=${totalExecTimeMs}, maxCaseTimeMs=${maxCaseTimeMs}, execRes.execTimeMs=${execRes?.execTimeMs}, execRes.memoryKb=${execRes?.memoryKb}, totalElapsedMs=${totalElapsedMs}`);
   
   await db.query(
     'UPDATE submissions SET status=?, exec_time_ms=?, memory_kb=? WHERE id=?',
@@ -310,16 +315,16 @@ app.post('/submit', async (req, res) => {
   // AC인 경우 랭킹 업데이트
   if (overall === 'AC') {
     try {
-      console.log(`[Submit] Calling updateRanking for user ${userId}, submission ${submissionId}`);
+      debugLog(`[Submit] Calling updateRanking for user ${userId}, submission ${submissionId}`);
       await updateRanking(userId);
-      console.log(`[Submit] updateRanking completed for user ${userId}`);
+      debugLog(`[Submit] updateRanking completed for user ${userId}`);
     } catch (e) {
       console.error('Failed to update ranking after submission:', e);
       console.error('Error stack:', e.stack);
       // 랭킹 업데이트 실패해도 제출은 성공으로 처리
     }
   } else {
-    console.log(`[Submit] Skipping ranking update - status is ${overall}, not AC`);
+    debugLog(`[Submit] Skipping ranking update - status is ${overall}, not AC`);
   }
 
   res.json({
@@ -341,54 +346,66 @@ app.post('/submit', async (req, res) => {
 // ---------- helpers ----------
 
 /**
+ * 문제별 최고 성능 제출의 시간과 메모리를 계산
+ */
+async function calculateProblemStats(userId, problemId) {
+  try {
+    // 가장 빠른 제출 찾기
+    const [submissionRows] = await db.query(
+      `SELECT s.id
+       FROM submissions s
+       WHERE s.user_id=? AND s.problem_id=? AND s.status='AC' 
+       ORDER BY s.id ASC
+       LIMIT 1`,
+      [userId, problemId]
+    );
+    
+    if (submissionRows.length === 0) {
+      return { time: 0, memory: 0 };
+    }
+    
+    const submissionId = submissionRows[0].id;
+    
+    // submission_results에서 실행 시간 합산
+    const [timeRows] = await db.query(
+      `SELECT SUM(sr.exec_time_ms) as total_time
+       FROM submission_results sr
+       WHERE sr.submission_id = ? AND sr.status = 'AC' AND sr.exec_time_ms IS NOT NULL AND sr.exec_time_ms > 0`,
+      [submissionId]
+    );
+    
+    let problemTime = 0;
+    if (timeRows[0] && timeRows[0].total_time != null) {
+      problemTime = Number(timeRows[0].total_time);
+    }
+    
+    // submissions 테이블에서 메모리 가져오기
+    const [submissionData] = await db.query(
+      `SELECT memory_kb FROM submissions WHERE id = ?`,
+      [submissionId]
+    );
+    
+    let problemMemory = 0;
+    if (submissionData[0] && submissionData[0].memory_kb != null && submissionData[0].memory_kb > 0) {
+      problemMemory = submissionData[0].memory_kb;
+    }
+    
+    return { time: problemTime, memory: problemMemory };
+  } catch (e) {
+    console.error(`[Ranking] Error calculating stats for user ${userId}, problem ${problemId}:`, e);
+    return { time: 0, memory: 0 };
+  }
+}
+
+/**
  * 랭킹 업데이트: 최소 1개 문제라도 AC로 통과한 유저들의 랭킹 계산
  * 랭킹 기준: 1) 해결한 문제 수 (많을수록 좋음), 2) 총 실행시간 합계 (적을수록 좋음), 3) 메모리 사용량 합계 (적을수록 좋음)
  */
 async function updateRanking(userId) {
   try {
-    console.log(`[Ranking] updateRanking called for user ${userId}`);
+    debugLog(`[Ranking] updateRanking called for user ${userId}`);
     
-    // 1. 모든 문제 목록 가져오기
-    const [allProblems] = await db.query('SELECT id FROM problems ORDER BY id');
-    console.log(`[Ranking] Found ${allProblems.length} problems`);
-    
-    if (allProblems.length === 0) {
-      // 문제가 없으면 랭킹 제거
-      await db.query(
-        'UPDATE users SET total_time_ms=NULL, total_memory_kb=NULL, `rank`=NULL WHERE id=?',
-        [userId]
-      );
-      console.log(`[Ranking] No problems found, cleared ranking for user ${userId}`);
-      return;
-    }
-
-    // 2. 해당 유저가 AC로 통과한 문제 수 확인
-    const [userAcCount] = await db.query(
-      `SELECT COUNT(DISTINCT problem_id) as count 
-       FROM submissions 
-       WHERE user_id=? AND status='AC'`,
-      [userId]
-    );
-
-    const acProblemCount = userAcCount[0]?.count || 0;
-    console.log(`[Ranking] User ${userId} has ${acProblemCount} AC problems`);
-
     // AC로 통과한 문제가 없으면 랭킹에서 제외
-    if (acProblemCount === 0) {
-      await db.query(
-        'UPDATE users SET total_time_ms=NULL, total_memory_kb=NULL, `rank`=NULL WHERE id=?',
-        [userId]
-      );
-      console.log(`[Ranking] User ${userId} has no AC problems, clearing ranking`);
-      // 다른 유저들의 랭킹도 재계산 필요
-      await recalculateAllRankings();
-      return;
-    }
-
-    // 3. AC로 통과한 문제들에 대해서만 최고 성능 제출 찾기
-    let totalTimeMs = 0;
-    let totalMemoryKb = 0;
-
     const [acProblems] = await db.query(
       `SELECT DISTINCT problem_id 
        FROM submissions 
@@ -396,55 +413,24 @@ async function updateRanking(userId) {
       [userId]
     );
 
+    if (acProblems.length === 0) {
+      await db.query(
+        'UPDATE users SET total_time_ms=NULL, total_memory_kb=NULL, `rank`=NULL WHERE id=?',
+        [userId]
+      );
+      debugLog(`[Ranking] User ${userId} has no AC problems, clearing ranking`);
+      await recalculateAllRankings();
+      return;
+    }
+
+    // AC로 통과한 문제들에 대해서만 최고 성능 제출 찾기
+    let totalTimeMs = 0;
+    let totalMemoryKb = 0;
+
     for (const acProblem of acProblems) {
-      let problemTime = 0;
-      let problemMemory = 0;
-      
-      // submission_results에서 직접 합산 (각 테스트 케이스의 실행 시간 합계)
-      try {
-        // 가장 빠른 제출의 submission_results에서 합산
-        const [submissionRows] = await db.query(
-          `SELECT s.id
-           FROM submissions s
-           WHERE s.user_id=? AND s.problem_id=? AND s.status='AC' 
-           ORDER BY s.id ASC
-           LIMIT 1`,
-          [userId, acProblem.problem_id]
-        );
-        
-        console.log(`[Ranking] updateRanking: Query returned ${submissionRows.length} rows for user ${userId}, problem ${acProblem.problem_id}`);
-        
-        if (submissionRows.length > 0) {
-          const submissionId = submissionRows[0].id;
-          console.log(`[Ranking] updateRanking: Found submission id=${submissionId} for user ${userId}, problem ${acProblem.problem_id}`);
-          
-          // submission_results에서 실행 시간 합산
-          const [timeRows] = await db.query(
-            `SELECT SUM(sr.exec_time_ms) as total_time
-             FROM submission_results sr
-             WHERE sr.submission_id = ? AND sr.status = 'AC' AND sr.exec_time_ms IS NOT NULL AND sr.exec_time_ms > 0`,
-            [submissionId]
-          );
-          
-          if (timeRows[0] && timeRows[0].total_time != null) {
-            problemTime = Number(timeRows[0].total_time);
-          }
-          
-          // submissions 테이블에서 메모리 가져오기
-          const [submissionData] = await db.query(
-            `SELECT memory_kb FROM submissions WHERE id = ?`,
-            [submissionId]
-          );
-          if (submissionData[0] && submissionData[0].memory_kb != null && submissionData[0].memory_kb > 0) {
-            problemMemory = submissionData[0].memory_kb;
-          }
-        }
-      } catch (e) {
-        console.error(`[Ranking] Error in updateRanking for user ${userId}, problem ${acProblem.problem_id}:`, e);
-      }
-      
-      totalTimeMs += problemTime;
-      totalMemoryKb += problemMemory;
+      const stats = await calculateProblemStats(userId, acProblem.problem_id);
+      totalTimeMs += stats.time;
+      totalMemoryKb += stats.memory;
     }
     
     // 최소값 보장 (0이면 랭킹에 포함되지 않을 수 있음)
@@ -452,18 +438,17 @@ async function updateRanking(userId) {
       totalTimeMs = 1; // 최소 1ms로 설정하여 랭킹에 포함되도록
     }
 
-    // 4. 유저의 총 시간/메모리 업데이트
-    console.log(`[Ranking] Updating user ${userId}: totalTimeMs=${totalTimeMs}, totalMemoryKb=${totalMemoryKb}`);
+    // 유저의 총 시간/메모리 업데이트
+    
+    debugLog(`[Ranking] Updating user ${userId}: totalTimeMs=${totalTimeMs}, totalMemoryKb=${totalMemoryKb}`);
     await db.query(
       'UPDATE users SET total_time_ms=?, total_memory_kb=? WHERE id=?',
       [totalTimeMs, totalMemoryKb, userId]
     );
-    console.log(`[Ranking] Updated user ${userId} total_time_ms and total_memory_kb`);
 
-    // 5. 모든 유저들의 랭킹 재계산
-    console.log(`[Ranking] Calling recalculateAllRankings after updating user ${userId}`);
+    // 모든 유저들의 랭킹 재계산
     await recalculateAllRankings();
-    console.log(`[Ranking] updateRanking completed successfully for user ${userId}`);
+    debugLog(`[Ranking] updateRanking completed successfully for user ${userId}`);
   } catch (e) {
     console.error('Failed to update ranking:', e);
     console.error('Error stack:', e.stack);
@@ -477,22 +462,10 @@ async function updateRanking(userId) {
  */
 async function recalculateAllRankings() {
   try {
-    console.log('[Ranking] Starting recalculation...');
+    debugLog('[Ranking] Starting recalculation...');
     
-    // 모든 문제 목록
-    const [allProblems] = await db.query('SELECT id FROM problems ORDER BY id');
-    console.log(`[Ranking] Found ${allProblems.length} problems`);
-    
-    if (allProblems.length === 0) {
-      // 문제가 없으면 모든 유저의 랭킹 제거
-      await db.query('UPDATE users SET `rank`=NULL, total_time_ms=NULL, total_memory_kb=NULL');
-      console.log('[Ranking] No problems found, cleared all rankings');
-      return;
-    }
-
     // 먼저 모든 유저의 랭킹을 초기화 (중복 방지)
     await db.query('UPDATE users SET `rank`=NULL');
-    console.log('[Ranking] Reset all user ranks');
 
     // 최소 1개 문제라도 AC로 통과한 유저들 찾기
     const [qualifiedUsers] = await db.query(
@@ -504,118 +477,41 @@ async function recalculateAllRankings() {
          WHERE s.user_id = u.id AND s.status = 'AC'
        ) > 0`
     );
-    console.log(`[Ranking] Found ${qualifiedUsers.length} qualified users with AC submissions`);
-    try {
-      if (qualifiedUsers.length > 0) {
-        console.log(`[Ranking] Qualified user IDs: ${qualifiedUsers.map(u => u.id).join(', ')}`);
-      }
-    } catch (e) {
-      console.error(`[Ranking] Error logging qualified user IDs:`, e);
-    }
+    debugLog(`[Ranking] Found ${qualifiedUsers.length} qualified users with AC submissions`);
 
     // 각 유저의 총 시간/메모리 재계산
-    console.log(`[Ranking] Starting to process ${qualifiedUsers.length} users`);
     for (let userIdx = 0; userIdx < qualifiedUsers.length; userIdx++) {
       const user = qualifiedUsers[userIdx];
       try {
-        console.log(`[Ranking] [${userIdx + 1}/${qualifiedUsers.length}] Processing user ${user.id}`);
+        debugLog(`[Ranking] Processing user ${user.id} (${userIdx + 1}/${qualifiedUsers.length})`);
         let totalTimeMs = 0;
         let totalMemoryKb = 0;
 
         // AC로 통과한 문제들만 계산
-        console.log(`[Ranking] [${userIdx + 1}/${qualifiedUsers.length}] Querying AC problems for user ${user.id}`);
         const [acProblems] = await db.query(
           `SELECT DISTINCT problem_id 
            FROM submissions 
            WHERE user_id=? AND status='AC'`,
           [user.id]
         );
-        console.log(`[Ranking] [${userIdx + 1}/${qualifiedUsers.length}] User ${user.id} has ${acProblems.length} AC problems`);
-        if (acProblems.length > 0) {
-          console.log(`[Ranking] [${userIdx + 1}/${qualifiedUsers.length}] Problem IDs: ${acProblems.map(p => p.problem_id).join(', ')}`);
-        }
 
-        for (let probIdx = 0; probIdx < acProblems.length; probIdx++) {
-          const acProblem = acProblems[probIdx];
-          try {
-            const problemId = acProblem.problem_id;
-            let problemTime = 0;
-            let problemMemory = 0;
-            
-            console.log(`[Ranking] [${userIdx + 1}/${qualifiedUsers.length}] [${probIdx + 1}/${acProblems.length}] Processing user ${user.id}, problem ${problemId}`);
-            
-            // submission_results에서 직접 합산 (각 테스트 케이스의 실행 시간 합계)
-            console.log(`[Ranking] Querying submission_results for user ${user.id}, problem ${problemId}`);
-            try {
-              // 가장 빠른 제출의 submission_results에서 합산
-              const [submissionRows] = await db.query(
-                `SELECT s.id
-                 FROM submissions s
-                 WHERE s.user_id=? AND s.problem_id=? AND s.status='AC' 
-                 ORDER BY s.id ASC
-                 LIMIT 1`,
-                [user.id, problemId]
-              );
-              
-              console.log(`[Ranking] Query returned ${submissionRows.length} rows for user ${user.id}, problem ${problemId}`);
-              
-              if (submissionRows.length > 0) {
-                const submissionId = submissionRows[0].id;
-                console.log(`[Ranking] Found submission id=${submissionId} for user ${user.id}, problem ${problemId}`);
-                
-                // submission_results에서 실행 시간 합산
-                const [timeRows] = await db.query(
-                  `SELECT SUM(sr.exec_time_ms) as total_time
-                   FROM submission_results sr
-                   WHERE sr.submission_id = ? AND sr.status = 'AC' AND sr.exec_time_ms IS NOT NULL AND sr.exec_time_ms > 0`,
-                  [submissionId]
-                );
-                console.log(`[Ranking] Time query result:`, JSON.stringify(timeRows));
-                
-                if (timeRows[0] && timeRows[0].total_time != null) {
-                  problemTime = Number(timeRows[0].total_time);
-                  console.log(`[Ranking] Using submission_results SUM for time: ${problemTime}ms`);
-                }
-                
-                // submissions 테이블에서 메모리 가져오기
-                const [submissionData] = await db.query(
-                  `SELECT memory_kb FROM submissions WHERE id = ?`,
-                  [submissionId]
-                );
-                if (submissionData[0] && submissionData[0].memory_kb != null && submissionData[0].memory_kb > 0) {
-                  problemMemory = submissionData[0].memory_kb;
-                  console.log(`[Ranking] Using submissions.memory_kb: ${problemMemory}KB`);
-                }
-              } else {
-                console.log(`[Ranking] No AC submission found for user ${user.id}, problem ${problemId}`);
-              }
-            } catch (e) {
-              console.error(`[Ranking] Error querying submission_results for user ${user.id}, problem ${problemId}:`, e);
-              console.error(`[Ranking] Error stack:`, e.stack);
-            }
-            
-            console.log(`[Ranking] Adding to totals: time=${problemTime}ms, memory=${problemMemory}KB (before: totalTime=${totalTimeMs}ms, totalMem=${totalMemoryKb}KB)`);
-            totalTimeMs += problemTime;
-            totalMemoryKb += problemMemory;
-            console.log(`[Ranking] After adding: totalTime=${totalTimeMs}ms, totalMem=${totalMemoryKb}KB`);
-          } catch (e) {
-            console.error(`[Ranking] Error processing problem ${acProblem.problem_id} for user ${user.id}:`, e);
-          }
+        for (const acProblem of acProblems) {
+          const stats = await calculateProblemStats(user.id, acProblem.problem_id);
+          totalTimeMs += stats.time;
+          totalMemoryKb += stats.memory;
         }
         
-        console.log(`[Ranking] Final totals for user ${user.id}: time=${totalTimeMs}ms, memory=${totalMemoryKb}KB`);
-        
-        // totalTimeMs가 0이면 랭킹에서 제외 (최소값 보장 로직 제거)
+        // totalTimeMs가 0이면 랭킹에서 제외
         if (totalTimeMs === 0) {
-          console.log(`[Ranking] User ${user.id} has totalTimeMs=0, skipping update (will be excluded from ranking)`);
-          continue; // 이 유저는 랭킹에서 제외
+          debugLog(`[Ranking] User ${user.id} has totalTimeMs=0, skipping update`);
+          continue;
         }
 
         await db.query(
           'UPDATE users SET total_time_ms=?, total_memory_kb=? WHERE id=?',
           [totalTimeMs, totalMemoryKb, user.id]
         );
-        console.log(`[Ranking] Updated user ${user.id}: time=${totalTimeMs}ms, memory=${totalMemoryKb}KB`);
+        debugLog(`[Ranking] Updated user ${user.id}: time=${totalTimeMs}ms, memory=${totalMemoryKb}KB`);
       } catch (e) {
         console.error(`[Ranking] Error processing user ${user.id}:`, e);
         console.error('Error stack:', e.stack);
@@ -634,19 +530,17 @@ async function recalculateAllRankings() {
        WHERE u.total_time_ms IS NOT NULL
        ORDER BY solved_count DESC, u.total_time_ms ASC, u.total_memory_kb ASC`
     );
-    console.log(`[Ranking] Found ${rankedUsers.length} users to rank`);
-
-    // 랭킹 업데이트
-    for (let i = 0; i < rankedUsers.length; i++) {
-      await db.query(
-        'UPDATE users SET `rank`=? WHERE id=?',
-        [i + 1, rankedUsers[i].id]
+    // 랭킹 업데이트 (배치 업데이트로 최적화)
+    if (rankedUsers.length > 0) {
+      const updatePromises = rankedUsers.map((user, i) =>
+        db.query('UPDATE users SET `rank`=? WHERE id=?', [i + 1, user.id])
       );
+      await Promise.all(updatePromises);
     }
-    console.log(`[Ranking] Assigned ranks to ${rankedUsers.length} users`);
+    debugLog(`[Ranking] Assigned ranks to ${rankedUsers.length} users`);
 
-    // 랭킹에서 제외된 유저들 (AC로 통과한 문제가 없는 경우) - 명시적으로 NULL 설정
-    const [excludedResult] = await db.query(
+    // 랭킹에서 제외된 유저들 (AC로 통과한 문제가 없는 경우)
+    await db.query(
       `UPDATE users 
        SET \`rank\`=NULL, total_time_ms=NULL, total_memory_kb=NULL
        WHERE (
@@ -655,8 +549,7 @@ async function recalculateAllRankings() {
          WHERE s.user_id = users.id AND s.status = 'AC'
        ) = 0`
     );
-    console.log(`[Ranking] Excluded users with no AC submissions`);
-    console.log('[Ranking] Recalculation completed successfully');
+    debugLog('[Ranking] Recalculation completed successfully');
   } catch (e) {
     console.error('Failed to recalculate rankings:', e);
     console.error('Error message:', e.message);
