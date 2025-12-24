@@ -183,13 +183,36 @@ document.getElementById('submit').onclick = async () => {
     : '-';
   const stderrText = data.lastStderr ? `\nstderr (마지막 케이스):\n${data.lastStderr}` : '';
 
-  // ✅ 결과창: 성공/시간/메모리만
+  // 랭킹 정보 가져오기
+  let rankText = '';
+  try {
+    const rankRes = await fetch('/api/leaderboard?limit=1000');
+    if (rankRes.ok) {
+      const leaderboard = await rankRes.json();
+      const userRank = leaderboard.findIndex(u => u.username === userName) + 1;
+      if (userRank > 0) {
+        const userInfo = leaderboard[userRank - 1];
+        rankText = `\n\n=== 랭킹 ===\n` +
+          `순위: ${userRank}위\n` +
+          `총 실행 시간: ${userInfo.total_time_ms ? (userInfo.total_time_ms + ' ms') : '-'}\n` +
+          `총 메모리: ${userInfo.total_memory_kb ? (userInfo.total_memory_kb + ' KB') : '-'}`;
+      } else {
+        rankText = `\n\n=== 랭킹 ===\n랭킹에 등록되지 않았습니다. (문제를 해결하면 랭킹에 표시됩니다)`;
+      }
+    }
+  } catch (e) {
+    // 랭킹 정보 가져오기 실패해도 무시
+    console.error('Failed to fetch ranking:', e);
+  }
+
+  // ✅ 결과창: 성공/시간/메모리 + 랭킹
   out.textContent =
     `성공 여부: ${okText}\n` +
     `경과 시간: ${timeText}\n` +
     `메모리: ${memText}\n` +
     `진행 상황: ${progressText}` +
-    stderrText;
+    stderrText +
+    rankText;
 
   await loadSubs();
 };

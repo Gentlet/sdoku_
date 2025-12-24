@@ -48,7 +48,6 @@ async function loadLeaderboard() {
     html += '<th>유저명</th>';
     html += '<th style="text-align: right;">총 실행시간</th>';
     html += '<th style="text-align: right;">총 메모리</th>';
-    html += '<th style="text-align: center;">해결한 문제</th>';
     html += '</tr></thead><tbody>';
     
     for (const user of data) {
@@ -56,7 +55,6 @@ async function loadLeaderboard() {
       const username = user.username || '-';
       const totalTime = user.total_time_ms != null ? `${user.total_time_ms} ms` : '-';
       const totalMemory = user.total_memory_kb != null ? `${user.total_memory_kb} KB` : '-';
-      const solvedCount = user.solved_count || 0;
       
       const rankClass = rank === 1 ? 'rank-1' : rank === 2 ? 'rank-2' : rank === 3 ? 'rank-3' : '';
       
@@ -65,7 +63,6 @@ async function loadLeaderboard() {
       html += `<td>${username}</td>`;
       html += `<td style="text-align: right;">${totalTime}</td>`;
       html += `<td style="text-align: right;">${totalMemory}</td>`;
-      html += `<td style="text-align: center;">${solvedCount}</td>`;
       html += '</tr>';
     }
     
